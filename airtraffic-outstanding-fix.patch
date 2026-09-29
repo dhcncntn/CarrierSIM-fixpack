@@ -1,0 +1,263 @@
+--- a/carrier.py
++++ b/carrier.py (CarrierSIM fix pack: AirTraffic + Books + recovery)
+@@ -31,19 +31,26 @@
+               'Books/Sync/Database/OutstandingAssets_4.sqlite-wal')
+ BOOK_DIRS = ('Books', 'Books/Sync', 'Books/Sync/Database')
+ 
+-# SQLite shared-memory/write-ahead-log sidecars under Books change on the
+-# phone at any moment (iOS rewrites them while Books is installed). Their
+-# bytes are never stable across two reads, so exact comparison is meaningless:
+-# presence + type is checked, content is ignored. The main .sqlite file is
+-# still restored and compared byte-for-byte.
++# Derived Books state changes on the phone at any moment while iOS holds it
++# open: sqlite sidecars AND the sqlite databases themselves (WAL checkpointing
++# rewrites bytes), lock files, sync-queue stores under Sync/ and MetadataStore/.
++# Their bytes are never stable across two reads, so exact comparison is
++# meaningless: presence + type is checked, content is ignored. User documents
++# match none of these patterns and are always compared byte-for-byte.
+ def is_volatile_book_node(name):
+-    return name.endswith('.sqlite-shm') or name.endswith('.sqlite-wal')
++    return (name.endswith(('.sqlite-shm', '.sqlite-wal', '.lock'))
++            or (name.endswith('.sqlite')
++                and (name.startswith('Sync/') or name.startswith('MetadataStore/'))))
+ 
+ 
+ def books_match(a, b):
+-    if set(a) != set(b):
+-        return False
++    # Tolerant: b must contain every node of a with matching type, and every
++    # non-volatile file must match byte-for-byte. Volatile nodes and extra
++    # nodes in b (iOS-created caches/locks, or files added mid-operation) are
++    # tolerated: none of them can make a restore invalid.
+     for name, (kind, data) in a.items():
++        if name not in b:
++            return False
+         other_kind, other_data = b[name]
+         if kind != other_kind:
+             return False
+@@ -172,6 +179,20 @@
+         return None
+ 
+ async def remote_tree(afc, root):
++    # iOS rewrites Books state while it is read (caches, sidecars, mtimes),
++    # which shows up as transient "changed during read" errors. Re-read the
++    # whole tree a couple of times before giving up: the last attempt sees a
++    # quiescent tree in practice.
++    for attempt in range(3):
++        try:
++            return await _remote_tree_once(afc, root)
++        except RuntimeError as error:
++            if attempt == 2 or not any(t in str(error) for t in (
++                    'changed during read', 'Remote directory changed', 'Remote size mismatch')):
++                raise
++            await asyncio.sleep(1)
++
++async def _remote_tree_once(afc, root):
+     tree = {}
+     total = 0
+     async def visit(path, name='', depth=0):
+@@ -231,18 +252,39 @@
+ async def restore_books(afc, tree, existed):
+     # Full-tree restore: AirTraffic on iOS 27 deletes purchased EPUBs from
+     # Books during sync, so restoring only BOOK_FILES always fails the final
+-    # `after == tree` check with "Books state differs". Restore everything:
+-    # missing dirs/files, conflicting files, and remove extras.
++    # check with "Books state differs". Restore everything: missing dirs and
++    # files, conflicting files, and derived extras. iOS rewrites caches under
++    # Books while this runs, so up to three reconcile passes are made before
++    # the state is accepted as truly diverged.
+     validate_tree(tree)
+     for name, (kind, _data) in tree.items():
+         require(kind in ('d', 'f'),
+                 f'Неожиданный тип узла Books в резервной копии: {name} ({kind})')
++    after = {}
++    for attempt in range(3):
++        await _reconcile_books(afc, tree, existed)
++        after = await remote_tree(afc, 'Books') if await exists(afc, 'Books') else {}
++        if books_match(after, tree):
++            return
++        if attempt < 2:
++            await asyncio.sleep(1.5)
++    missing = [n for n in tree if n not in after]
++    changed = [n for n in tree if n in after and tree[n] != after[n]
++               and not (tree[n][0] == 'f' and is_volatile_book_node(n))]
++    extra = [n for n in after if n not in tree]
++    raise RuntimeError(
++        'Books state differs; backups retained, inspect before retry '
++        f'(missing={len(missing)} changed={changed[:10]} extra={extra[:10]})')
++
++async def _reconcile_books(afc, tree, existed):
+     current = await remote_tree(afc, 'Books') if await exists(afc, 'Books') else {}
+     if books_match(current, tree):
+         return
+-    # 1. Delete extras, deepest first (files before their parent dirs).
+-    # Known lock files are NOT deleted here: step 4 removes them only if
+-    # they are empty regular files, otherwise it stops and keeps the backup.
++    # 1. Delete derived extras, deepest first (files before their parent dirs).
++    #    Anything that could be user content (non-volatile, outside Sync/) is
++    #    kept: a book added during the operation must never be lost. Known
++    #    lock files are NOT deleted here: step 4 removes them only if
++    #    they are empty regular files, otherwise it stops and keeps the backup.
+     skip_extra = ('Managed/.Managed.plist.lock', 'Sync/.bookSync.lock')
+     for name in sorted(set(current) - set(tree),
+                        key=lambda n: (n.count('/'), n), reverse=True):
+@@ -260,6 +302,8 @@
+                 continue  # children not removed yet; final check will report
+             await afc.rm_single(path)
+         elif kind == 'f':
++            if not is_volatile_book_node(name) and not name.startswith('Sync/'):
++                continue  # could be user content; keep it
+             if await exists(afc, path) is not None:
+                 await afc.rm_single(path)
+         else:
+@@ -277,7 +321,7 @@
+         if current.get(name) == ('f', data):
+             continue
+         if is_volatile_book_node(name) and current.get(name, (None,))[0] == 'f':
+-            continue  # sidecar exists; its bytes are ephemeral, no rewrite needed
++            continue  # sidecar/db exists; its bytes are ephemeral, no rewrite needed
+         path = 'Books/' + name
+         node = await exists(afc, path)
+         require(node is None or node['st_ifmt'] == 'S_IFREG',
+@@ -301,15 +345,62 @@
+         was_present = existed if path == 'Books' else path.removeprefix('Books/') in tree
+         if not was_present and await exists(afc, path) and not await afc.listdir(path):
+             await afc.rm_single(path)
+-    after = await remote_tree(afc, 'Books') if await exists(afc, 'Books') else {}
+-    if not books_match(after, tree):
+-        missing = [n for n in tree if n not in after]
+-        changed = [n for n in tree if n in after and tree[n] != after[n]
+-                   and not (tree[n][0] == 'f' and is_volatile_book_node(n))]
+-        extra = [n for n in after if n not in tree]
+-        raise RuntimeError(
+-            'Books state differs; backups retained, inspect before retry '
+-            f'(missing={len(missing)} changed={changed[:10]} extra={extra[:10]})')
++
++async def clean_outstanding(afc):
++    # iOS tracks Book sync assets by Persistent ID in the OutstandingAssets
++    # store (Books/Sync/Database/OutstandingAssets_*.sqlite; the numeric suffix
++    # varies across iOS versions). Path-based assets keep one row per
++    # identifier, so after an interrupted session the stale row makes iOS
++    # silently drop that asset from every later manifest (observed as
++    # "2 of 3 confirmed" on iOS 27). Real book assets never use relative
++    # paths, so removing path-like rows only touches sync-tool leftovers and
++    # is safe for the user's library. Best effort: never raises.
++    import sqlite3, shutil, tempfile
++    try:
++        names = [n for n in await afc.listdir('Books/Sync/Database')
++                 if n.startswith('OutstandingAssets_') and n.endswith('.sqlite')]
++    except Exception:
++        return
++    tmp = Path(tempfile.mkdtemp())
++    try:
++        for name in names:
++            base = 'Books/Sync/Database/' + name
++            try:
++                (tmp / name).write_bytes(await afc.get_file_contents(base))
++            except Exception:
++                continue
++            for suffix in ('-wal', '-shm'):
++                try:
++                    (tmp / (name + suffix)).write_bytes(await afc.get_file_contents(base + suffix))
++                except Exception:
++                    pass
++            try:
++                db = sqlite3.connect(tmp / name)
++                dropped = 0
++                for table in ('ZBCOUTSTANDINGASSET', 'ZBCINSTALLEDASSET'):
++                    try:
++                        cols = {r[1] for r in db.execute(f'pragma table_info({table})')}
++                        if 'ZPERSISTENTID' in cols:
++                            dropped += db.execute(
++                                f"delete from {table} where ZPERSISTENTID LIKE '../%'").rowcount
++                    except Exception:
++                        pass
++                db.commit(); db.close()
++            except Exception:
++                continue
++            if not dropped:
++                continue
++            try:
++                await afc.set_file_contents(base, (tmp / name).read_bytes())
++                for suffix in ('-wal', '-shm'):
++                    try: await afc.rm_single(base + suffix)
++                    except Exception: pass
++                print(f'Очистил зависшие записи синхронизации AirTraffic: {dropped}.', flush=True)
++            except Exception as e:
++                print(f'Не удалось обновить {name}: {e}', flush=True)
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
+ 
+ async def transfer(device, run, payload=None, expected=None, recovery=False):
+     from pymobiledevice3.services.afc import AfcService
+@@ -332,6 +423,7 @@
+         for path in (source, link, exported):
+             require(await exists(afc, path) is None, 'Staging path collision')
+         books, books_existed = await books_snapshot(afc, run)
++        await clean_outstanding(afc)
+         mutated = False
+         try:
+             raw = staging_archive(payload)
+@@ -410,6 +502,7 @@
+                     journal['books_restore_error'] = str(e)
+                     save_json(run / 'journal.json', journal)
+                     raise
++                await clean_outstanding(afc)
+                 save_json(run / 'journal.json', journal)
+     # Remote originals and staging identifiers are intentionally retained for recovery.
+     return snapshot
+@@ -821,13 +914,13 @@
+             if not transient_error(error):raise
+             failed=pending(args.runs,args.udid)
+             if failed:
+-                print('Связь прервалась. Сначала восстанавливаю незавершённый этап…',flush=True)
+-                require(len(failed)==1,'Несколько незавершённых этапов: требуется --recover.')
++                print('Связь прервалась. Сначала восстанавливаю незавершённые этапы…',flush=True)
+                 device=await ready_device(args.udid,args.wait_seconds)
+                 recovery=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+'auto-recovery-'+uuid.uuid4().hex[:6])
+                 recovery.mkdir(mode=0o700)
+                 try:
+-                    await recover_stage(device,failed[0],recovery)
++                    for i,stage in enumerate(failed):
++                        await recover_stage(device,stage,recovery if i==0 else recovery/f'batch-{i}')
+                 except BaseException:
+                     print('Автовосстановление не завершено. Новая запись отменена. Журнал:',recovery,flush=True)
+                     raise
+@@ -959,13 +1052,17 @@
+             check_trigger(args.trigger,{str(r.get('MCC',''))+str(r.get('MNC','')) for r in rows})
+             check_trigger_hardware(args.trigger,info['HardwareModel'])
+         unresolved=pending(args.runs,udid)
+-        if args.recover == Path('AUTO'):
+-            if not unresolved:
+-                print('Незавершённых операций для этого iPhone нет.');return 0
+-            require(len(unresolved)==1,'Найдено несколько незавершённых этапов; требуется разбор журналов.')
+-            args.recover=unresolved[0]
+-        require(not unresolved or (args.recover and all(p.resolve()==args.recover.resolve() for p in unresolved)),
+-                'Сначала выполните --recover для этапа: '+str(unresolved[0] if unresolved else ''))
++        recover_all=args.recover==Path('AUTO')
++        if recover_all and not unresolved:
++            print('Незавершённых операций для этого iPhone нет.');return 0
++        if unresolved:
++            if recover_all:
++                args.recover=unresolved[0]
++            else:
++                require(args.recover is not None,
++                        'Сначала выполните --recover для этапа: '+str(unresolved[0]))
++                require(args.recover.resolve() in {p.resolve() for p in unresolved},
++                        'Сначала выполните --recover для этапа: '+str(unresolved[0]))
+         run=args.runs/(datetime.now().strftime('%Y%m%d-%H%M%S-')+uuid.uuid4().hex[:6])
+         run.mkdir(mode=0o700)
+         print('Копии и журнал:',run,flush=True)
+@@ -985,7 +1082,10 @@
+             check_trigger(trigger,plmns);check_trigger_hardware(trigger,info['HardwareModel'])
+         require(trigger is not None,'Не найден независимый триггер для этих SIM.')
+         if args.recover:
+-            await recover_stage(device,args.recover.resolve(),run)
++            # AUTO recovers every pending stage, not just the first one.
++            stages=[p.resolve() for p in unresolved] if recover_all else [args.recover.resolve()]
++            for i,stage in enumerate(stages):
++                await recover_stage(device,stage,run if i==0 else run/f'batch-{i}')
+         elif args.restore:
+             print('[1/4] Подготавливаю пересканирование…',flush=True)
+             init=run/'initialize';init.mkdir();await install_trigger(device,trigger,init)

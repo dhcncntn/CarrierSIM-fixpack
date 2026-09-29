@@ -1,0 +1,36 @@
+name: build-release
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Pack
+        run: |
+          mkdir -p dist
+          zip -rq dist/CarrierSIM-fixpack.zip . -x '.git/*' '.github/*' '*.DS_Store'
+      - name: Publish
+        uses: ncipollo/release-action@v1
+        with:
+          tag: latest
+          name: 'CarrierSIM fix pack (latest)'
+          allowUpdates: true
+          replacesArtifacts: true
+          artifacts: 'dist/CarrierSIM-fixpack.zip'
+          makeLatest: true
+          body: |
+            Всегда свежая сборка фикс-пака — пересобирается при каждом пуше в main.
+
+            Стабильная ссылка на скачивание (не меняется):
+            https://github.com/dhcncntn/CarrierSIM-fixpack/releases/latest/download/CarrierSIM-fixpack.zip
+
+            Подробности — в README-airtraffic-fix.md внутри архива.
+          token: ${{ secrets.GITHUB_TOKEN }}
